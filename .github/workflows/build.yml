@@ -1,0 +1,477 @@
+name: Build Flashlight APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          set -e
+          cat > settings.gradle.kts <<'__FLASHLIGHT_EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+
+          rootProject.name = "Flashlight"
+          include(":app")
+          __FLASHLIGHT_EOF__
+          cat > build.gradle.kts <<'__FLASHLIGHT_EOF__'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          __FLASHLIGHT_EOF__
+          cat > gradle.properties <<'__FLASHLIGHT_EOF__'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          __FLASHLIGHT_EOF__
+          mkdir -p app
+          cat > app/build.gradle.kts <<'__FLASHLIGHT_EOF__'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.flashlight"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.flashlight"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      isMinifyEnabled = false
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.appcompat:appcompat:1.7.0")
+              implementation("com.google.android.material:material:1.12.0")
+          }
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-feature
+                  android:name="android.hardware.camera.flash"
+                  android:required="false" />
+
+              <application
+                  android:allowBackup="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@style/Theme.Flashlight">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:screenOrientation="portrait">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/java/com/example/flashlight
+          cat > app/src/main/java/com/example/flashlight/MainActivity.kt <<'__FLASHLIGHT_EOF__'
+          package com.example.flashlight
+
+          import android.content.Context
+          import android.hardware.camera2.CameraAccessException
+          import android.hardware.camera2.CameraCharacteristics
+          import android.hardware.camera2.CameraManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.widget.SeekBar
+          import android.widget.TextView
+          import androidx.appcompat.app.AppCompatActivity
+          import com.google.android.material.button.MaterialButton
+          import kotlin.math.roundToInt
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var cameraManager: CameraManager
+              private lateinit var seekBar: SeekBar
+              private lateinit var percentText: TextView
+              private lateinit var infoText: TextView
+              private lateinit var powerButton: MaterialButton
+
+              private var cameraId: String? = null
+
+              /** Максимальный аппаратный уровень яркости вспышки (1 = регулировка не поддерживается). */
+              private var maxLevel = 1
+              private val strengthSupported: Boolean
+                  get() = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && maxLevel > 1
+
+              private var lastPercent = 100
+              private var updatingFromCode = false
+
+              private val torchCallback = object : CameraManager.TorchCallback() {
+                  override fun onTorchModeChanged(id: String, enabled: Boolean) {
+                      if (id != cameraId) return
+                      runOnUiThread {
+                          if (!enabled) {
+                              setUi(0)
+                          } else {
+                              setUi(currentPercentFromHardware())
+                          }
+                      }
+                  }
+
+                  override fun onTorchStrengthLevelChanged(id: String, newStrengthLevel: Int) {
+                      if (id != cameraId || !strengthSupported) return
+                      runOnUiThread {
+                          setUi((newStrengthLevel * 100f / maxLevel).roundToInt().coerceIn(1, 100))
+                      }
+                  }
+
+                  override fun onTorchModeUnavailable(id: String) {
+                      if (id != cameraId) return
+                      runOnUiThread { infoText.setText(R.string.torch_unavailable) }
+                  }
+              }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContentView(R.layout.activity_main)
+
+                  seekBar = findViewById(R.id.brightnessSeekBar)
+                  percentText = findViewById(R.id.percentText)
+                  infoText = findViewById(R.id.infoText)
+                  powerButton = findViewById(R.id.powerButton)
+
+                  cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  cameraId = findFlashCamera()
+
+                  if (cameraId == null) {
+                      infoText.setText(R.string.no_flash)
+                      seekBar.isEnabled = false
+                      powerButton.isEnabled = false
+                      return
+                  }
+
+                  if (strengthSupported) {
+                      infoText.text = getString(R.string.levels_info, maxLevel)
+                  } else {
+                      infoText.setText(R.string.no_strength_support)
+                  }
+
+                  seekBar.max = 100
+                  seekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(bar: SeekBar, progress: Int, fromUser: Boolean) {
+                          if (updatingFromCode) return
+                          applyPercent(progress)
+                      }
+
+                      override fun onStartTrackingTouch(bar: SeekBar) {}
+                      override fun onStopTrackingTouch(bar: SeekBar) {}
+                  })
+
+                  powerButton.setOnClickListener {
+                      if (seekBar.progress > 0) {
+                          applyPercent(0)
+                      } else {
+                          applyPercent(lastPercent)
+                      }
+                  }
+
+                  setUi(0)
+              }
+
+              override fun onStart() {
+                  super.onStart()
+                  if (cameraId != null) {
+                      cameraManager.registerTorchCallback(torchCallback, Handler(Looper.getMainLooper()))
+                  }
+              }
+
+              override fun onStop() {
+                  super.onStop()
+                  if (cameraId != null) {
+                      cameraManager.unregisterTorchCallback(torchCallback)
+                  }
+              }
+
+              /** Ищем камеру со вспышкой (предпочтительно заднюю). */
+              private fun findFlashCamera(): String? {
+                  var chosen: String? = null
+                  var chosenMax = 1
+                  for (id in cameraManager.cameraIdList) {
+                      val chars = cameraManager.getCameraCharacteristics(id)
+                      if (chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) != true) continue
+                      val max = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                          chars.get(CameraCharacteristics.FLASH_INFO_STRENGTH_MAXIMUM_LEVEL) ?: 1
+                      } else {
+                          1
+                      }
+                      val isBack = chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+                      if (isBack) {
+                          maxLevel = max
+                          return id
+                      }
+                      if (chosen == null) {
+                          chosen = id
+                          chosenMax = max
+                      }
+                  }
+                  maxLevel = chosenMax
+                  return chosen
+              }
+
+              /** Применяет яркость 0..100 % к вспышке. 0 — выключено, 1..100 — от самой тусклой до самой яркой. */
+              private fun applyPercent(percent: Int) {
+                  val id = cameraId ?: return
+                  try {
+                      if (percent <= 0) {
+                          cameraManager.setTorchMode(id, false)
+                      } else if (strengthSupported) {
+                          // 1% -> уровень 1 (самый тусклый), 100% -> maxLevel (самый яркий)
+                          val level = (percent / 100f * maxLevel).roundToInt().coerceIn(1, maxLevel)
+                          cameraManager.turnOnTorchWithStrengthLevel(id, level)
+                      } else {
+                          cameraManager.setTorchMode(id, true)
+                      }
+                  } catch (e: CameraAccessException) {
+                      infoText.setText(R.string.torch_unavailable)
+                      setUi(0)
+                      return
+                  } catch (e: IllegalArgumentException) {
+                      infoText.setText(R.string.torch_unavailable)
+                      setUi(0)
+                      return
+                  }
+                  setUi(percent)
+              }
+
+              private fun currentPercentFromHardware(): Int {
+                  val id = cameraId ?: return 100
+                  if (!strengthSupported) return 100
+                  return try {
+                      val level = cameraManager.getTorchStrengthLevel(id)
+                      (level * 100f / maxLevel).roundToInt().coerceIn(1, 100)
+                  } catch (e: Exception) {
+                      100
+                  }
+              }
+
+              private fun setUi(percent: Int) {
+                  if (percent > 0) lastPercent = percent
+                  updatingFromCode = true
+                  seekBar.progress = percent
+                  updatingFromCode = false
+
+                  if (percent > 0 && strengthSupported) {
+                      val level = (percent / 100f * maxLevel).roundToInt().coerceIn(1, maxLevel)
+                      percentText.text = getString(R.string.brightness_with_level, percent, level, maxLevel)
+                  } else {
+                      percentText.text = getString(R.string.brightness_percent, percent)
+                  }
+                  powerButton.setText(if (percent > 0) R.string.btn_off else R.string.btn_on)
+                  powerButton.isSelected = percent > 0
+              }
+          }
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/res/layout
+          cat > app/src/main/res/layout/activity_main.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:background="@color/bg"
+              android:gravity="center"
+              android:orientation="vertical"
+              android:padding="24dp">
+
+              <com.google.android.material.button.MaterialButton
+                  android:id="@+id/powerButton"
+                  android:layout_width="180dp"
+                  android:layout_height="180dp"
+                  android:text="@string/btn_on"
+                  android:textColor="@color/bg"
+                  android:textSize="24sp"
+                  android:textStyle="bold"
+                  app:backgroundTint="@color/accent"
+                  app:cornerRadius="90dp"
+                  xmlns:app="http://schemas.android.com/apk/res-auto" />
+
+              <TextView
+                  android:id="@+id/percentText"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="40dp"
+                  android:textColor="@color/text"
+                  android:textSize="28sp"
+                  android:textStyle="bold" />
+
+              <SeekBar
+                  android:id="@+id/brightnessSeekBar"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="24dp"
+                  android:max="100"
+                  android:minHeight="48dp" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:orientation="horizontal">
+
+                  <TextView
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="@string/dim"
+                      android:textColor="@color/muted" />
+
+                  <TextView
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="@string/bright"
+                      android:textColor="@color/muted" />
+              </LinearLayout>
+
+              <TextView
+                  android:id="@+id/infoText"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="32dp"
+                  android:gravity="center"
+                  android:textColor="@color/muted"
+                  android:textSize="13sp" />
+          </LinearLayout>
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">Фонарик</string>
+              <string name="btn_on">ВКЛ</string>
+              <string name="btn_off">ВЫКЛ</string>
+              <string name="dim">Тусклее</string>
+              <string name="bright">Ярче</string>
+              <string name="brightness_percent">Яркость: %1$d%%</string>
+              <string name="brightness_with_level">Яркость: %1$d%% (уровень %2$d из %3$d)</string>
+              <string name="levels_info">Аппаратная вспышка вашего телефона поддерживает %1$d уровней яркости. Ползунок 1–100% плавно сопоставляется с ними.</string>
+              <string name="no_strength_support">Этот телефон не поддерживает регулировку яркости вспышки (нужен Android 13+ и поддержка в камере). Доступно только включение и выключение.</string>
+              <string name="no_flash">На этом устройстве нет вспышки.</string>
+              <string name="torch_unavailable">Фонарик сейчас недоступен (возможно, его использует другое приложение).</string>
+          </resources>
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/colors.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <color name="bg">#121214</color>
+              <color name="accent">#FFC107</color>
+              <color name="text">#FFFFFF</color>
+              <color name="muted">#9A9AA0</color>
+          </resources>
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/themes.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <style name="Theme.Flashlight" parent="Theme.Material3.Dark.NoActionBar">
+                  <item name="android:windowBackground">@color/bg</item>
+                  <item name="android:statusBarColor">@color/bg</item>
+                  <item name="android:navigationBarColor">@color/bg</item>
+                  <item name="colorPrimary">@color/accent</item>
+              </style>
+          </resources>
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher_foreground.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path
+                  android:fillColor="#FFC107"
+                  android:pathData="M42,30 L66,30 L62,44 L46,44 Z" />
+              <path
+                  android:fillColor="#FFFFFF"
+                  android:pathData="M46,46 L62,46 L62,80 Q62,84 58,84 L50,84 Q46,84 46,80 Z" />
+              <path
+                  android:fillColor="#FFC107"
+                  android:pathData="M50,58 a4,4 0 1,0 8,0 a4,4 0 1,0 -8,0" />
+          </vector>
+          __FLASHLIGHT_EOF__
+          mkdir -p app/src/main/res/mipmap-anydpi-v26
+          cat > app/src/main/res/mipmap-anydpi-v26/ic_launcher.xml <<'__FLASHLIGHT_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/bg" />
+              <foreground android:drawable="@drawable/ic_launcher_foreground" />
+          </adaptive-icon>
+          __FLASHLIGHT_EOF__
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK to Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk flashlight.apk
+          gh release create "v${{ github.run_number }}" flashlight.apk --repo "${{ github.repository }}" --target "${{ github.sha }}" --title "Flashlight v${{ github.run_number }}" --notes "Debug APK"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flashlight-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
